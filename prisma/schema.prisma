@@ -1,0 +1,134 @@
+// Prisma schema — Cultura App MVP
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  displayName  String   @map("display_name")
+  bio          String?  @db.VarChar(150)
+  avatarUrl    String?  @map("avatar_url")
+  isPrivate    Boolean  @default(false) @map("is_private")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  userContent        UserContent[]
+  sentRecommendations     Recommendation[] @relation("sender")
+  receivedRecommendations Recommendation[] @relation("receiver")
+  notifications      Notification[]
+
+  @@map("users")
+}
+
+model Content {
+  id          String      @id @default(cuid())
+  type        ContentType
+  externalId  String      @map("external_id")
+  title       String
+  subtitle    String?
+  creator     String?     // director / autor / artista
+  year        Int?
+  genre       String?
+  coverUrl    String?     @map("cover_url")
+  synopsis    String?     @db.Text
+  createdAt   DateTime    @default(now()) @map("created_at")
+
+  userContent     UserContent[]
+  recommendations Recommendation[]
+
+  @@unique([type, externalId])
+  @@map("content")
+}
+
+enum ContentType {
+  MOVIE
+  BOOK
+  SERIES
+  MUSIC_ARTIST
+  MUSIC_ALBUM
+  MUSIC_TRACK
+}
+
+model UserContent {
+  id              String           @id @default(cuid())
+  userId          String           @map("user_id")
+  contentId       String           @map("content_id")
+  status          ContentStatus
+  rating          Int?             // 1-5
+  review          String?          @db.VarChar(500)
+  isFavorite      Boolean          @default(false) @map("is_favorite")
+  progressValue   Int?             @map("progress_value")  // página actual / episodio
+  progressTotal   Int?             @map("progress_total")  // total páginas / episodios
+  dateStarted     DateTime?        @map("date_started")
+  dateFinished    DateTime?        @map("date_finished")
+  recommendedById String?          @map("recommended_by_id")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+
+  user        User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content     Content @relation(fields: [contentId], references: [id])
+
+  @@unique([userId, contentId])
+  @@map("user_content")
+}
+
+enum ContentStatus {
+  WATCHED       // películas / series vistas
+  WATCHING      // series en progreso
+  WANT_TO_WATCH // pendiente (privado)
+  READ          // libros leídos
+  READING       // libros en progreso
+  WANT_TO_READ  // pendiente (privado)
+  FAVORITE      // música favorita
+}
+
+model Recommendation {
+  id              String               @id @default(cuid())
+  senderId        String               @map("sender_id")
+  receiverId      String               @map("receiver_id")
+  contentId       String               @map("content_id")
+  message         String?              @db.VarChar(200)
+  status          RecommendationStatus @default(PENDING)
+  acknowledgedAt  DateTime?            @map("acknowledged_at")
+  createdAt       DateTime             @default(now()) @map("created_at")
+
+  sender   User    @relation("sender", fields: [senderId], references: [id])
+  receiver User    @relation("receiver", fields: [receiverId], references: [id])
+  content  Content @relation(fields: [contentId], references: [id])
+
+  @@map("recommendations")
+}
+
+enum RecommendationStatus {
+  PENDING
+  SAVED
+  ACKNOWLEDGED  // el receptor lo consumió y confirmó el origen
+  IGNORED
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String           @map("user_id")
+  type      NotificationType
+  data      Json
+  read      Boolean          @default(false)
+  createdAt DateTime         @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("notifications")
+}
+
+enum NotificationType {
+  RECOMMENDATION_RECEIVED   // te han recomendado algo
+  RECOMMENDATION_FOLLOWED   // alguien siguió tu recomendación
+}
