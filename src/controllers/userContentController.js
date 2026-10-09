@@ -1,120 +1,89 @@
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const { supabase } = require('../lib/supabase');
 
-// Valid status values per content type
 const VALID_STATUSES = {
-  MOVIE: ['WATCHED', 'WANT_TO_WATCH'],
-  BOOK: ['READ', 'READING', 'WANT_TO_READ'],
-  SERIES: ['WATCHED', 'WATCHING', 'WANT_TO_WATCH'],
+  MOVIE:        ['WATCHED', 'WANT_TO_WATCH'],
+  BOOK:         ['READ', 'READING', 'WANT_TO_READ'],
+  SERIES:       ['WATCHED', 'WATCHING', 'WANT_TO_WATCH'],
   MUSIC_ARTIST: ['FAVORITE'],
-  MUSIC_ALBUM: ['FAVORITE'],
-  MUSIC_TRACK: ['FAVORITE'],
+  MUSIC_ALBUM:  ['FAVORITE'],
+  MUSIC_TRACK:  ['FAVORITE'],
 };
 
 // GET /user-content?type=MOVIE&status=WATCHED&page=1
 const getMyList = async (req, res, next) => {
   try {
     const { type, status, page = 1 } = req.query;
-    const take = 20;
-    const skip = (parseInt(page) - 1) * take;
+    const pageSize = 20;
+    const from = (parseInt(page) - 1) * pageSize;
+    const to = from + pageSize - 1;
 
-    const where = { userId: req.user.id };
-    if (type) where.content = { type };
-    if (status) where.status = status;
+    let query = supabase
+      .from('user_content')
+      .select('*, content(*)', { count: 'exact' })
+      .eq('user_id', req.user.id)
+      .order('updated_at', { ascending: false })
+      .range(from, to);
 
-    const [items, total] = await Promise.all([
-      prisma.userContent.findMany({
-        where,
-        include: {
-          content: {
-            select: { id: true, type: true, title: true, creator: true, year: true, coverUrl: true, genre: true },
-          },
-        },
-        orderBy: { updatedAt: 'desc' },
-        take,
-        skip,
-      }),
-      prisma.userContent.count({ where }),
-    ]);
+    if (status) query = query.eq('status', status);
+    if (type)   query = query.eq('content_type', type);
 
-    res.json({ items, total, page: parseInt(page), totalPages: Math.ceil(total / take) });
+    const { data: items, count, error } = await query;
+    if (error) return next(error);
+
+    res.json({
+      items: items ?? [],
+      total: count ?? 0,
+      page: parseInt(page),
+      totalPages: Math.ceil((count ?? 0) / pageSize),
+    });
   } catch (err) {
     next(err);
   }
 };
 
 // POST /user-content
-// Body: { contentId, status, rating?, review?, isFavorite?, progressValue?, progressTotal?, dateStarted?, dateFinished? }
 const upsert = async (req, res, next) => {
   try {
     const userId = req.user.id;
-    const {
-      contentId,
-      status,
-      rating,
-      review,
-      isFavorite,
-      progressValue,
-      progressTotal,
-      dateStarted,
-      dateFinished,
-      recommendedById,
-    } = req.body;
+    const { contentId, status, rating, review, isFavorite, progressValue, progressTotal, dateStarted, dateFinished } = req.body;
 
-    if (!contentId) return res.status(400).json({ error: 'contentId requerido' });
-    if (!status) return res.status(400).json({ error: 'status requerido' });
-
-    // Validate content exists
-    const content = await prisma.content.findUnique({ where: { id: contentId } });
-    if (!content) return res.status(404).json({ error: 'Contenido no encontrado' });
-
-    // Validate status for content type
-    const validStatuses = VALID_STATUSES[content.type] || [];
-    if (!validStatuses.includes(status)) {
-      return res.status(400).json({
-        error: `Estado inválido para ${content.type}. Válidos: ${validStatuses.join(', ')}`,
-      });
+    if (!contentId || !status) {
+      return res.status(400).json({ error: 'contentId y status son obligatorios' });
     }
 
-    // Validate rating
+    // Validate content exists and get type
+    const { data: content } = await supabase.from('content').select('id, type').eq('id', contentId).single();
+    if (!content) return res.status(404).json({ error: 'Contenido no encontrado' });
+
+    const validStatuses = VALID_STATUSES[content.type] ?? [];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ error: `Estado inválido. Válidos: ${validStatuses.join(', ')}` });
+    }
     if (rating !== undefined && (rating < 1 || rating > 5)) {
       return res.status(400).json({ error: 'La puntuación debe estar entre 1 y 5' });
     }
 
-    // Review only allowed if status is WATCHED or READ
-    if (review && !['WATCHED', 'READ'].includes(status)) {
-      return res.status(400).json({ error: 'Solo puedes escribir reseña si has terminado el contenido' });
-    }
-
-    const entry = await prisma.userContent.upsert({
-      where: { userId_contentId: { userId, contentId } },
-      create: {
-        userId,
-        contentId,
+    const { data, error } = await supabase
+      .from('user_content')
+      .upsert({
+        user_id: userId,
+        content_id: contentId,
+        content_type: content.type,
         status,
-        ...(rating !== undefined && { rating }),
-        ...(review !== undefined && { review }),
-        ...(isFavorite !== undefined && { isFavorite }),
-        ...(progressValue !== undefined && { progressValue }),
-        ...(progressTotal !== undefined && { progressTotal }),
-        ...(dateStarted && { dateStarted: new Date(dateStarted) }),
-        ...(dateFinished && { dateFinished: new Date(dateFinished) }),
-        ...(recommendedById && { recommendedById }),
-      },
-      update: {
-        status,
-        ...(rating !== undefined && { rating }),
-        ...(review !== undefined && { review }),
-        ...(isFavorite !== undefined && { isFavorite }),
-        ...(progressValue !== undefined && { progressValue }),
-        ...(progressTotal !== undefined && { progressTotal }),
-        ...(dateStarted && { dateStarted: new Date(dateStarted) }),
-        ...(dateFinished && { dateFinished: new Date(dateFinished) }),
-      },
-      include: { content: true },
-    });
+        ...(rating      !== undefined && { rating }),
+        ...(review      !== undefined && { review }),
+        ...(isFavorite  !== undefined && { is_favorite: isFavorite }),
+        ...(progressValue !== undefined && { progress_value: progressValue }),
+        ...(progressTotal !== undefined && { progress_total: progressTotal }),
+        ...(dateStarted  && { date_started: dateStarted }),
+        ...(dateFinished && { date_finished: dateFinished }),
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'user_id,content_id' })
+      .select('*, content(*)')
+      .single();
 
-    res.status(200).json(entry);
+    if (error) return next(error);
+    res.json(data);
   } catch (err) {
     next(err);
   }
@@ -123,10 +92,13 @@ const upsert = async (req, res, next) => {
 // DELETE /user-content/:contentId
 const remove = async (req, res, next) => {
   try {
-    const { contentId } = req.params;
-    await prisma.userContent.deleteMany({
-      where: { userId: req.user.id, contentId },
-    });
+    const { error } = await supabase
+      .from('user_content')
+      .delete()
+      .eq('user_id', req.user.id)
+      .eq('content_id', req.params.contentId);
+
+    if (error) return next(error);
     res.json({ message: 'Eliminado de tu lista' });
   } catch (err) {
     next(err);
