@@ -1,7 +1,6 @@
+const { supabase } = require('../lib/supabase');
 const { searchMovies, searchSeries, getMovieDetail, getSeriesDetail } = require('../services/tmdbService');
 const { searchBooks, getBookDetail } = require('../services/booksService');
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
 
 // GET /content/search?q=&type=movie|book|series|all&page=1
 const search = async (req, res, next) => {
@@ -13,16 +12,9 @@ const search = async (req, res, next) => {
     }
 
     const results = {};
-
-    if (type === 'all' || type === 'movie') {
-      results.movies = await searchMovies(q, parseInt(page));
-    }
-    if (type === 'all' || type === 'series') {
-      results.series = await searchSeries(q, parseInt(page));
-    }
-    if (type === 'all' || type === 'book') {
-      results.books = await searchBooks(q, parseInt(page) - 1);
-    }
+    if (type === 'all' || type === 'movie') results.movies = await searchMovies(q, parseInt(page));
+    if (type === 'all' || type === 'series') results.series = await searchSeries(q, parseInt(page));
+    if (type === 'all' || type === 'book') results.books = await searchBooks(q, parseInt(page) - 1);
 
     res.json(results);
   } catch (err) {
@@ -35,80 +27,68 @@ const getDetail = async (req, res, next) => {
   try {
     const { type, externalId } = req.params;
 
-    // Check if we already have it in our DB (cached)
-    let dbContent = await prisma.content.findUnique({
-      where: {
-        type_externalId: {
-          type: type.toUpperCase(),
-          externalId,
-        },
-      },
-    });
+    // Check Supabase cache first
+    const { data: cached } = await supabase
+      .from('content')
+      .select('*')
+      .eq('type', type.toUpperCase())
+      .eq('external_id', externalId)
+      .single();
 
-    // Fetch fresh data from external API
+    // Fetch fresh from external API
     let externalData;
     switch (type) {
-      case 'movie':
-        externalData = await getMovieDetail(externalId);
-        break;
-      case 'series':
-        externalData = await getSeriesDetail(externalId);
-        break;
-      case 'book':
-        externalData = await getBookDetail(externalId);
-        break;
-      default:
-        return res.status(400).json({ error: 'Tipo de contenido no válido' });
+      case 'movie':   externalData = await getMovieDetail(externalId); break;
+      case 'series':  externalData = await getSeriesDetail(externalId); break;
+      case 'book':    externalData = await getBookDetail(externalId); break;
+      default: return res.status(400).json({ error: 'Tipo no válido: movie | book | series' });
     }
 
-    // Upsert in our DB (cache it)
-    dbContent = await prisma.content.upsert({
-      where: {
-        type_externalId: {
-          type: externalData.type,
-          externalId: externalData.externalId,
-        },
-      },
-      create: {
+    // Upsert into Supabase (cache)
+    const { data: content, error: upsertError } = await supabase
+      .from('content')
+      .upsert({
         type: externalData.type,
-        externalId: externalData.externalId,
+        external_id: externalData.externalId,
         title: externalData.title,
-        subtitle: externalData.subtitle,
-        creator: externalData.creator,
-        year: externalData.year,
-        genre: externalData.genre,
-        coverUrl: externalData.coverUrl,
-        synopsis: externalData.synopsis,
-      },
-      update: {
-        title: externalData.title,
-        coverUrl: externalData.coverUrl,
-        synopsis: externalData.synopsis,
-      },
-    });
+        subtitle: externalData.subtitle ?? null,
+        creator: externalData.creator ?? null,
+        year: externalData.year ?? null,
+        genre: externalData.genre ?? null,
+        cover_url: externalData.coverUrl ?? null,
+        synopsis: externalData.synopsis ?? null,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'type,external_id' })
+      .select()
+      .single();
 
-    // Get platform stats (how many users have it)
-    const stats = await prisma.userContent.aggregate({
-      where: { contentId: dbContent.id },
-      _count: true,
-      _avg: { rating: true },
-    });
+    if (upsertError) return next(upsertError);
 
-    // If user is logged in, get their status for this content
-    const userEntry = req.user
-      ? await prisma.userContent.findUnique({
-          where: { userId_contentId: { userId: req.user.id, contentId: dbContent.id } },
-        })
+    // Platform stats
+    const { data: statsRows } = await supabase
+      .from('user_content')
+      .select('rating')
+      .eq('content_id', content.id)
+      .not('rating', 'is', null);
+
+    const ratings = (statsRows ?? []).map((r) => r.rating);
+    const avgRating = ratings.length
+      ? Math.round((ratings.reduce((a, b) => a + b, 0) / ratings.length) * 10) / 10
       : null;
 
+    // User's own entry
+    const { data: userEntry } = await supabase
+      .from('user_content')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .eq('content_id', content.id)
+      .single();
+
     res.json({
-      ...dbContent,
-      ...externalData, // extra fields like runtime, pageCount, etc.
-      platformStats: {
-        totalUsers: stats._count,
-        averageRating: stats._avg.rating ? Math.round(stats._avg.rating * 10) / 10 : null,
-      },
-      userStatus: userEntry,
+      ...content,
+      ...externalData,
+      platformStats: { totalUsers: statsRows?.length ?? 0, averageRating: avgRating },
+      userStatus: userEntry ?? null,
     });
   } catch (err) {
     next(err);
