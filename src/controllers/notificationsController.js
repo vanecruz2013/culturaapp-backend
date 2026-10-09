@@ -1,67 +1,44 @@
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const { supabase } = require('../lib/supabase');
 
-// GET /notifications?page=1
 const getAll = async (req, res, next) => {
   try {
     const { page = 1 } = req.query;
-    const take = 30;
-    const skip = (parseInt(page) - 1) * take;
+    const pageSize = 30;
+    const from = (parseInt(page) - 1) * pageSize;
 
-    const [items, total] = await Promise.all([
-      prisma.notification.findMany({
-        where: { userId: req.user.id },
-        orderBy: { createdAt: 'desc' },
-        take,
-        skip,
-      }),
-      prisma.notification.count({ where: { userId: req.user.id } }),
-    ]);
+    const { data: items, count, error } = await supabase
+      .from('notifications')
+      .select('*', { count: 'exact' })
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false })
+      .range(from, from + pageSize - 1);
 
-    res.json({ items, total, page: parseInt(page), totalPages: Math.ceil(total / take) });
-  } catch (err) {
-    next(err);
-  }
+    if (error) return next(error);
+    res.json({ items: items ?? [], total: count ?? 0, page: parseInt(page), totalPages: Math.ceil((count ?? 0) / pageSize) });
+  } catch (err) { next(err); }
 };
 
-// PATCH /notifications/:id/read
 const markRead = async (req, res, next) => {
   try {
-    const { id } = req.params;
-    const notification = await prisma.notification.findUnique({ where: { id } });
-    if (!notification || notification.userId !== req.user.id) {
-      return res.status(404).json({ error: 'Notificación no encontrada' });
-    }
-    await prisma.notification.update({ where: { id }, data: { read: true } });
+    const { data: notif } = await supabase.from('notifications').select('user_id').eq('id', req.params.id).single();
+    if (!notif || notif.user_id !== req.user.id) return res.status(404).json({ error: 'No encontrada' });
+    await supabase.from('notifications').update({ read: true }).eq('id', req.params.id);
     res.json({ message: 'Marcada como leída' });
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 };
 
-// PATCH /notifications/read-all
 const markAllRead = async (req, res, next) => {
   try {
-    await prisma.notification.updateMany({
-      where: { userId: req.user.id, read: false },
-      data: { read: true },
-    });
+    await supabase.from('notifications').update({ read: true }).eq('user_id', req.user.id).eq('read', false);
     res.json({ message: 'Todas marcadas como leídas' });
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 };
 
-// GET /notifications/unread-count
 const unreadCount = async (req, res, next) => {
   try {
-    const count = await prisma.notification.count({
-      where: { userId: req.user.id, read: false },
-    });
-    res.json({ count });
-  } catch (err) {
-    next(err);
-  }
+    const { count } = await supabase.from('notifications').select('*', { count: 'exact', head: true }).eq('user_id', req.user.id).eq('read', false);
+    res.json({ count: count ?? 0 });
+  } catch (err) { next(err); }
 };
 
 module.exports = { getAll, markRead, markAllRead, unreadCount };
