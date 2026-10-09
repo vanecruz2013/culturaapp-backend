@@ -1,7 +1,9 @@
-const jwt = require('jsonwebtoken');
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const { supabase } = require('../lib/supabase');
 
+/**
+ * Verifica el JWT emitido por Supabase.
+ * El token llega en el header Authorization: Bearer <token>
+ */
 const authenticate = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
@@ -10,21 +12,36 @@ const authenticate = async (req, res, next) => {
     }
 
     const token = authHeader.slice(7);
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
 
-    const user = await prisma.user.findUnique({
-      where: { id: payload.userId },
-      select: { id: true, username: true, email: true, displayName: true, avatarUrl: true },
-    });
+    // Supabase verifica la firma y la expiración del token
+    const { data: { user }, error } = await supabase.auth.getUser(token);
 
-    if (!user) return res.status(401).json({ error: 'Usuario no encontrado' });
-
-    req.user = user;
-    next();
-  } catch (err) {
-    if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') {
+    if (error || !user) {
       return res.status(401).json({ error: 'Token inválido o expirado' });
     }
+
+    // Adjuntamos el usuario de Supabase al request
+    // user.id es el UUID de Supabase Auth (coincide con profiles.id)
+    req.user = {
+      id: user.id,
+      email: user.email,
+    };
+
+    // Enriquecer con datos del perfil (username, displayName)
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('username, display_name, avatar_url')
+      .eq('id', user.id)
+      .single();
+
+    if (profile) {
+      req.user.username = profile.username;
+      req.user.displayName = profile.display_name;
+      req.user.avatarUrl = profile.avatar_url;
+    }
+
+    next();
+  } catch (err) {
     next(err);
   }
 };
