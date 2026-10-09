@@ -1,8 +1,6 @@
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const { supabase } = require('../lib/supabase');
 
 // POST /recommendations
-// Body: { receiverUsername, contentId, message? }
 const send = async (req, res, next) => {
   try {
     const { receiverUsername, contentId, message } = req.body;
@@ -11,56 +9,55 @@ const send = async (req, res, next) => {
     if (!receiverUsername || !contentId) {
       return res.status(400).json({ error: 'receiverUsername y contentId son obligatorios' });
     }
-
-    // Can't recommend to yourself
     if (receiverUsername === req.user.username) {
       return res.status(400).json({ error: 'No puedes recomendarte contenido a ti mismo' });
     }
-
     if (message && message.length > 200) {
       return res.status(400).json({ error: 'El mensaje no puede superar 200 caracteres' });
     }
 
-    // Find receiver
-    const receiver = await prisma.user.findUnique({ where: { username: receiverUsername } });
+    const { data: receiver } = await supabase.from('profiles').select('id').eq('username', receiverUsername.toLowerCase()).single();
     if (!receiver) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-    // Find content
-    const content = await prisma.content.findUnique({ where: { id: contentId } });
+    const { data: content } = await supabase.from('content').select('id, title, type, cover_url').eq('id', contentId).single();
     if (!content) return res.status(404).json({ error: 'Contenido no encontrado' });
 
-    // Check if already sent and pending
-    const existing = await prisma.recommendation.findFirst({
-      where: { senderId, receiverId: receiver.id, contentId, status: 'PENDING' },
-    });
+    // Check for existing pending recommendation
+    const { data: existing } = await supabase
+      .from('recommendations')
+      .select('id')
+      .eq('sender_id', senderId)
+      .eq('receiver_id', receiver.id)
+      .eq('content_id', contentId)
+      .eq('status', 'PENDING')
+      .single();
+
     if (existing) {
-      return res.status(409).json({ error: 'Ya tienes una recomendación pendiente de este contenido para ese usuario' });
+      return res.status(409).json({ error: 'Ya tienes una recomendación pendiente para ese usuario' });
     }
 
-    const recommendation = await prisma.recommendation.create({
-      data: { senderId, receiverId: receiver.id, contentId, message: message || null },
-      include: {
-        content: { select: { title: true, type: true, coverUrl: true } },
-        receiver: { select: { username: true, displayName: true } },
-      },
-    });
+    const { data: recommendation, error } = await supabase
+      .from('recommendations')
+      .insert({ sender_id: senderId, receiver_id: receiver.id, content_id: contentId, message: message ?? null })
+      .select()
+      .single();
 
-    // Create notification for receiver
-    await prisma.notification.create({
+    if (error) return next(error);
+
+    // Notification for receiver
+    await supabase.from('notifications').insert({
+      user_id: receiver.id,
+      type: 'RECOMMENDATION_RECEIVED',
       data: {
-        userId: receiver.id,
-        type: 'RECOMMENDATION_RECEIVED',
-        data: {
-          recommendationId: recommendation.id,
-          senderId,
-          senderUsername: req.user.username,
-          senderDisplayName: req.user.displayName,
-          contentId,
-          contentTitle: content.title,
-          contentType: content.type,
-          contentCoverUrl: content.coverUrl,
-          message: message || null,
-        },
+        recommendationId: recommendation.id,
+        senderId,
+        senderUsername: req.user.username,
+        senderDisplayName: req.user.displayName,
+        contentId,
+        contentTitle: content.title,
+        contentType: content.type,
+        contentCoverUrl: content.cover_url,
+        message: message ?? null,
       },
     });
 
@@ -70,31 +67,26 @@ const send = async (req, res, next) => {
   }
 };
 
-// GET /recommendations/received?status=PENDING&page=1
+// GET /recommendations/received
 const getReceived = async (req, res, next) => {
   try {
     const { status, page = 1 } = req.query;
-    const take = 20;
-    const skip = (parseInt(page) - 1) * take;
+    const pageSize = 20;
+    const from = (parseInt(page) - 1) * pageSize;
 
-    const where = { receiverId: req.user.id };
-    if (status) where.status = status;
+    let query = supabase
+      .from('recommendations')
+      .select('*, sender:profiles!sender_id(username,display_name,avatar_url), content(*)', { count: 'exact' })
+      .eq('receiver_id', req.user.id)
+      .order('created_at', { ascending: false })
+      .range(from, from + pageSize - 1);
 
-    const [items, total] = await Promise.all([
-      prisma.recommendation.findMany({
-        where,
-        include: {
-          sender: { select: { username: true, displayName: true, avatarUrl: true } },
-          content: { select: { id: true, title: true, type: true, coverUrl: true, creator: true, year: true } },
-        },
-        orderBy: { createdAt: 'desc' },
-        take,
-        skip,
-      }),
-      prisma.recommendation.count({ where }),
-    ]);
+    if (status) query = query.eq('status', status);
 
-    res.json({ items, total, page: parseInt(page), totalPages: Math.ceil(total / take) });
+    const { data: items, count, error } = await query;
+    if (error) return next(error);
+
+    res.json({ items: items ?? [], total: count ?? 0, page: parseInt(page), totalPages: Math.ceil((count ?? 0) / pageSize) });
   } catch (err) {
     next(err);
   }
@@ -104,33 +96,24 @@ const getReceived = async (req, res, next) => {
 const getSent = async (req, res, next) => {
   try {
     const { page = 1 } = req.query;
-    const take = 20;
-    const skip = (parseInt(page) - 1) * take;
+    const pageSize = 20;
+    const from = (parseInt(page) - 1) * pageSize;
 
-    const where = { senderId: req.user.id };
+    const { data: items, count, error } = await supabase
+      .from('recommendations')
+      .select('*, receiver:profiles!receiver_id(username,display_name,avatar_url), content(*)', { count: 'exact' })
+      .eq('sender_id', req.user.id)
+      .order('created_at', { ascending: false })
+      .range(from, from + pageSize - 1);
 
-    const [items, total] = await Promise.all([
-      prisma.recommendation.findMany({
-        where,
-        include: {
-          receiver: { select: { username: true, displayName: true, avatarUrl: true } },
-          content: { select: { id: true, title: true, type: true, coverUrl: true } },
-        },
-        orderBy: { createdAt: 'desc' },
-        take,
-        skip,
-      }),
-      prisma.recommendation.count({ where }),
-    ]);
-
-    res.json({ items, total, page: parseInt(page), totalPages: Math.ceil(total / take) });
+    if (error) return next(error);
+    res.json({ items: items ?? [], total: count ?? 0, page: parseInt(page), totalPages: Math.ceil((count ?? 0) / pageSize) });
   } catch (err) {
     next(err);
   }
 };
 
 // PATCH /recommendations/:id/status
-// Body: { status: 'SAVED' | 'ACKNOWLEDGED' | 'IGNORED' }
 const updateStatus = async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -141,40 +124,36 @@ const updateStatus = async (req, res, next) => {
       return res.status(400).json({ error: `Estado inválido. Válidos: ${ALLOWED.join(', ')}` });
     }
 
-    const recommendation = await prisma.recommendation.findUnique({ where: { id } });
-    if (!recommendation) return res.status(404).json({ error: 'Recomendación no encontrada' });
-    if (recommendation.receiverId !== req.user.id) {
-      return res.status(403).json({ error: 'No puedes modificar esta recomendación' });
-    }
+    const { data: rec } = await supabase.from('recommendations').select('*').eq('id', id).single();
+    if (!rec) return res.status(404).json({ error: 'Recomendación no encontrada' });
+    if (rec.receiver_id !== req.user.id) return res.status(403).json({ error: 'Sin permiso' });
 
-    const updated = await prisma.recommendation.update({
-      where: { id },
-      data: {
+    const { data: updated, error } = await supabase
+      .from('recommendations')
+      .update({
         status,
-        ...(status === 'ACKNOWLEDGED' && { acknowledgedAt: new Date() }),
-      },
-    });
+        ...(status === 'ACKNOWLEDGED' && { acknowledged_at: new Date().toISOString() }),
+      })
+      .eq('id', id)
+      .select()
+      .single();
 
-    // If ACKNOWLEDGED: notify the sender
+    if (error) return next(error);
+
+    // Notify sender if acknowledged
     if (status === 'ACKNOWLEDGED') {
-      const content = await prisma.content.findUnique({
-        where: { id: recommendation.contentId },
-        select: { title: true, type: true },
-      });
-
-      await prisma.notification.create({
+      const { data: content } = await supabase.from('content').select('title, type').eq('id', rec.content_id).single();
+      await supabase.from('notifications').insert({
+        user_id: rec.sender_id,
+        type: 'RECOMMENDATION_FOLLOWED',
         data: {
-          userId: recommendation.senderId,
-          type: 'RECOMMENDATION_FOLLOWED',
-          data: {
-            recommendationId: id,
-            receiverId: req.user.id,
-            receiverUsername: req.user.username,
-            receiverDisplayName: req.user.displayName,
-            contentId: recommendation.contentId,
-            contentTitle: content.title,
-            contentType: content.type,
-          },
+          recommendationId: id,
+          receiverId: req.user.id,
+          receiverUsername: req.user.username,
+          receiverDisplayName: req.user.displayName,
+          contentId: rec.content_id,
+          contentTitle: content?.title,
+          contentType: content?.type,
         },
       });
     }
