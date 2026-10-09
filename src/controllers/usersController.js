@@ -1,47 +1,47 @@
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const { supabase } = require('../lib/supabase');
 
 // GET /users/:username
 const getProfile = async (req, res, next) => {
   try {
     const { username } = req.params;
-    const user = await prisma.user.findUnique({
-      where: { username },
-      select: {
-        id: true,
-        username: true,
-        displayName: true,
-        bio: true,
-        avatarUrl: true,
-        isPrivate: true,
-        createdAt: true,
-        _count: {
-          select: {
-            userContent: {
-              where: { status: { in: ['WATCHED', 'READ', 'FAVORITE'] } },
-            },
-          },
-        },
-      },
+
+    const { data: profile, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('username', username.toLowerCase())
+      .single();
+
+    if (error || !profile) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    // Recent activity (last 5 items)
+    const { data: recentActivity } = await supabase
+      .from('user_content')
+      .select('*, content(*)')
+      .eq('user_id', profile.id)
+      .in('status', ['WATCHED', 'READ', 'FAVORITE'])
+      .order('updated_at', { ascending: false })
+      .limit(5);
+
+    // Counts
+    const { count: moviesCount } = await supabase
+      .from('user_content')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', profile.id)
+      .eq('status', 'WATCHED');
+
+    const { count: booksCount } = await supabase
+      .from('user_content')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', profile.id)
+      .eq('status', 'READ');
+
+    res.json({
+      ...profile,
+      counts: { movies: moviesCount ?? 0, books: booksCount ?? 0 },
+      recentActivity: profile.is_private ? [] : (recentActivity ?? []),
     });
-
-    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
-
-    // Get recent activity (last 5 items)
-    const recentActivity = user.isPrivate
-      ? []
-      : await prisma.userContent.findMany({
-          where: { userId: user.id },
-          orderBy: { updatedAt: 'desc' },
-          take: 5,
-          include: {
-            content: {
-              select: { title: true, type: true, coverUrl: true, creator: true },
-            },
-          },
-        });
-
-    res.json({ ...user, recentActivity });
   } catch (err) {
     next(err);
   }
@@ -59,19 +59,20 @@ const updateProfile = async (req, res, next) => {
       return res.status(400).json({ error: 'La bio no puede superar 150 caracteres' });
     }
 
-    const updated = await prisma.user.update({
-      where: { id: req.user.id },
-      data: {
-        ...(displayName !== undefined && { displayName }),
-        ...(bio !== undefined && { bio }),
-        ...(avatarUrl !== undefined && { avatarUrl }),
-      },
-      select: {
-        id: true, username: true, displayName: true, bio: true, avatarUrl: true,
-      },
-    });
+    const updates = { updated_at: new Date().toISOString() };
+    if (displayName !== undefined) updates.display_name = displayName;
+    if (bio !== undefined) updates.bio = bio;
+    if (avatarUrl !== undefined) updates.avatar_url = avatarUrl;
 
-    res.json(updated);
+    const { data, error } = await supabase
+      .from('profiles')
+      .update(updates)
+      .eq('id', req.user.id)
+      .select()
+      .single();
+
+    if (error) return next(error);
+    res.json(data);
   } catch (err) {
     next(err);
   }
@@ -82,22 +83,21 @@ const getStats = async (req, res, next) => {
   try {
     const userId = req.user.id;
 
-    const [moviesWatched, booksRead, seriesWatched, recommendationsSent, recommendationsFollowed] =
-      await Promise.all([
-        prisma.userContent.count({ where: { userId, status: 'WATCHED', content: { type: 'MOVIE' } } }),
-        prisma.userContent.count({ where: { userId, status: 'READ', content: { type: 'BOOK' } } }),
-        prisma.userContent.count({ where: { userId, status: 'WATCHED', content: { type: 'SERIES' } } }),
-        prisma.recommendation.count({ where: { senderId: userId } }),
-        prisma.recommendation.count({ where: { senderId: userId, status: 'ACKNOWLEDGED' } }),
-      ]);
+    const [
+      { count: moviesWatched },
+      { count: booksRead },
+      { count: seriesWatched },
+      { count: recommendationsSent },
+      { count: recommendationsFollowed },
+    ] = await Promise.all([
+      supabase.from('user_content').select('*', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'WATCHED').eq('content_type', 'MOVIE'),
+      supabase.from('user_content').select('*', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'READ'),
+      supabase.from('user_content').select('*', { count: 'exact', head: true }).eq('user_id', userId).eq('status', 'WATCHED').eq('content_type', 'SERIES'),
+      supabase.from('recommendations').select('*', { count: 'exact', head: true }).eq('sender_id', userId),
+      supabase.from('recommendations').select('*', { count: 'exact', head: true }).eq('sender_id', userId).eq('status', 'ACKNOWLEDGED'),
+    ]);
 
-    res.json({
-      moviesWatched,
-      booksRead,
-      seriesWatched,
-      recommendationsSent,
-      recommendationsFollowed,
-    });
+    res.json({ moviesWatched, booksRead, seriesWatched, recommendationsSent, recommendationsFollowed });
   } catch (err) {
     next(err);
   }
