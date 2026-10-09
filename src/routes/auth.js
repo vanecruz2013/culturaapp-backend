@@ -1,51 +1,21 @@
 const express = require('express');
 const router = express.Router();
-const { body } = require('express-validator');
+const { authenticate } = require('../middleware/authenticate');
 const authController = require('../controllers/authController');
 
-// POST /auth/register
-router.post(
-  '/register',
-  [
-    body('username')
-      .trim()
-      .isLength({ min: 3, max: 30 })
-      .withMessage('El usuario debe tener entre 3 y 30 caracteres')
-      .matches(/^[a-zA-Z0-9_]+$/)
-      .withMessage('Solo letras, números y guiones bajos'),
-    body('email').isEmail().normalizeEmail().withMessage('Email no válido'),
-    body('password')
-      .isLength({ min: 8 })
-      .withMessage('La contraseña debe tener al menos 8 caracteres'),
-    body('displayName')
-      .trim()
-      .isLength({ min: 1, max: 50 })
-      .withMessage('El nombre es obligatorio'),
-  ],
-  authController.register
-);
+/**
+ * Con Supabase, el registro y login ocurren directamente en la app móvil
+ * usando el SDK de Supabase (@supabase/supabase-js).
+ * El backend solo necesita:
+ * - Un endpoint para completar el perfil tras el registro (username, displayName)
+ * - Verificación de token en las rutas protegidas (via middleware authenticate)
+ */
 
-// POST /auth/login
-router.post(
-  '/login',
-  [
-    body('email').isEmail().normalizeEmail().withMessage('Email no válido'),
-    body('password').notEmpty().withMessage('Contraseña requerida'),
-  ],
-  authController.login
-);
+// POST /auth/complete-profile — se llama una vez tras registrarse en Supabase
+// Body: { username, displayName }
+router.post('/complete-profile', authenticate, authController.completeProfile);
 
-// POST /auth/refresh
-router.post('/refresh', authController.refresh);
-
-// POST /auth/logout
-router.post('/logout', authController.logout);
-
-// POST /auth/forgot-password
-router.post(
-  '/forgot-password',
-  [body('email').isEmail().normalizeEmail()],
-  authController.forgotPassword
-);
+// GET /auth/me — devuelve el perfil del usuario autenticado
+router.get('/me', authenticate, authController.getMe);
 
 module.exports = router;
